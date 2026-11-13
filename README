@@ -1,0 +1,909 @@
+# 🏢 WorkSphere — Multi-Tenant Leave & Workforce Management SaaS
+
+> A multi-tenant SaaS where companies register and independently manage employees, departments, leave, attendance, approvals and reports — with strict tenant isolation.
+> Built as a **modular monolith** on **React · Node.js/Express · PostgreSQL · Redis · Kafka**, deployed with **Docker on AWS (EC2 + RDS)**.
+
+![Node](https://img.shields.io/badge/Node.js-22%2B-green) ![Express](https://img.shields.io/badge/Express-5-black) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue) ![Redis](https://img.shields.io/badge/Redis-7-red) ![Kafka](https://img.shields.io/badge/Kafka-KRaft-black) ![React](https://img.shields.io/badge/React-19-61dafb) ![Jest](https://img.shields.io/badge/tests-Jest%20%2B%20Supertest-c21325)
+
+> *Project name "WorkSphere" is a placeholder — rename freely.*
+
+---
+
+## 📑 Table of Contents
+
+1. [What This Project Demonstrates](#-what-this-project-demonstrates)
+2. [Features](#-features)
+3. [Architecture](#-architecture)
+4. [Key Design Decisions](#-key-design-decisions)
+5. [Tech Stack](#-tech-stack)
+6. [Project Structure](#-project-structure)
+7. [Database Design](#-database-design)
+8. [Multi-Tenancy & Tenant Isolation](#-multi-tenancy--tenant-isolation)
+9. [Events & Kafka](#-events--kafka)
+10. [Redis Usage](#-redis-usage)
+11. [Build Guide — Step 1 to Step 20](#-build-guide--step-1-to-step-20)
+12. [Running Locally](#-running-locally)
+13. [Environment Variables](#-environment-variables)
+14. [API Overview](#-api-overview)
+15. [Testing](#-testing)
+16. [Deployment (AWS)](#-deployment-aws)
+17. [CI/CD](#-cicd)
+18. [Failure Scenarios](#-failure-scenarios)
+19. [Interview Talking Points](#-interview-talking-points)
+20. [Roadmap Checklist](#-roadmap-checklist)
+
+---
+
+## 🎯 What This Project Demonstrates
+
+This is **not** a CRUD demo. The focus is backend correctness under real-world conditions:
+
+- **Tenant isolation** enforced in the application *and* the database (composite foreign keys + Postgres Row-Level Security)
+- **Atomic operations** — approving leave and deducting balance in one transaction with row-level locks
+- **Race-condition prevention** — overlapping leave blocked by a Postgres **exclusion constraint**; concurrent approvals handled with `SELECT … FOR UPDATE`
+- **Reliable event publishing** — the **transactional outbox** pattern (no lost events)
+- **Kafka fundamentals** — partitions, keys & ordering, consumer groups, offsets, at-least-once delivery, idempotent consumers, retries, dead-letter topics
+- **Secure auth** — short-lived access tokens, rotating refresh tokens with **reuse detection**, hashed tokens, rate-limited login, secure password reset
+- **Production hygiene** — validation, centralised errors, structured logs, health checks, graceful shutdown, timeouts
+
+---
+
+## ✨ Features
+
+| Area | Capabilities |
+|---|---|
+| **Authentication** | Company registration, login/logout, access + refresh tokens, refresh rotation with reuse detection, bcrypt hashing, RBAC, secure password reset, active-session list & revoke |
+| **Multi-tenancy** | Many companies on one platform; isolated data, departments and leave policies per company |
+| **Employees** | Create, update, deactivate; assign department, role and reporting manager; profiles; search, filter, paginate |
+| **Departments** | CRUD per company; department-wise statistics |
+| **Leave** | Annual / sick / unpaid; balances; apply, approve, reject, cancel; history; overlap prevention; concurrency-safe approvals |
+| **Attendance** | Check-in / check-out; working hours; late-arrival tracking; daily & monthly reports |
+| **Notifications** | In-app inbox + email; managers notified of requests; employees notified of decisions |
+| **Dashboard** | Total employees, department stats, pending approvals, monthly leave stats, attendance summaries |
+| **Audit logs** | Who did what, what changed (before/after), when — for employee, leave, role and admin actions |
+
+### Roles
+
+| Role | Can do |
+|---|---|
+| `admin` | Everything in their company: settings, leave policies, roles, all employees |
+| `hr` | Manage employees & departments, approve any leave, view reports & audit logs |
+| `manager` | Approve/reject leave for their direct reports, view their team's attendance |
+| `employee` | Own profile, apply/cancel leave, check in/out, view own history & notifications |
+
+---
+
+## 🏗️ Architecture
+
+```
+                    ┌───────────────────────────┐
+                    │   React SPA (Tailwind)    │
+                    └─────────────┬─────────────┘
+                                  │ HTTPS (JSON + httpOnly refresh cookie)
+                    ┌─────────────▼─────────────┐
+                    │  Nginx (reverse proxy)    │  TLS · serves React build · proxies /api
+                    └─────────────┬─────────────┘
+                                  │
+        ┌─────────────────────────▼─────────────────────────┐
+        │        API process — Express modular monolith     │
+        │                                                   │
+        │  auth · companies · employees · departments ·     │
+        │  leave · attendance · notifications · reports ·   │
+        │  audit                                            │
+        │                                                   │
+        │  Routes → Controllers → Services → Repositories   │
+        └──────┬──────────────────────────────┬─────────────┘
+               │ SQL (transactions, locks)    │ cache · rate limits ·
+               │                              │ reset tokens
+        ┌──────▼───────────┐           ┌──────▼──────┐
+        │   PostgreSQL     │           │    Redis    │
+        │ business tables  │           └─────────────┘
+        │ + outbox_events  │
+        └──────┬───────────┘
+               │ polled (FOR UPDATE SKIP LOCKED)
+        ┌──────▼───────────┐   publish   ┌─────────────────────┐
+        │  Outbox relay    ├────────────►│       Kafka         │
+        │  (worker)        │             │ leave-events        │
+        └──────────────────┘             │ employee-events     │
+                                         │ attendance-events   │
+                                         │ *.dlt               │
+                                         └──────────┬──────────┘
+                              ┌─────────────────────┴─────────────────────┐
+                    ┌─────────▼──────────┐                      ┌─────────▼──────────┐
+                    │ Notification worker│                      │  Reporting worker  │
+                    │ group: notifications│                     │ group: reporting   │
+                    │ in-app + email     │                      │ monthly aggregates │
+                    └────────────────────┘                      └────────────────────┘
+```
+
+**One codebase, multiple processes.** The API and workers share the same modules but run as separate Node processes (`src/server.js`, `src/workers/*.js`). This is still a monolith — one repo, one database, one deployable — but slow side effects (email) can never block an API request.
+
+### Request layering
+
+| Layer | Responsibility | Must NOT |
+|---|---|---|
+| **Routes** | URL + HTTP method → middleware chain → controller | contain logic |
+| **Controllers** | Read validated input, call a service, shape the HTTP response | contain business rules or SQL |
+| **Services** | Business rules, transactions, authorisation decisions, audit + outbox writes | know about `req`/`res` |
+| **Repositories** | Parameterised SQL; every function takes `companyId` | contain business rules |
+| **Database** | Constraints, locks, RLS — the last line of defence | — |
+
+### Synchronous vs asynchronous
+
+| Operation | Mechanism | Reason |
+|---|---|---|
+| Approve leave + deduct balance | **One DB transaction** | Must be atomic |
+| Prevent overlapping leave | **DB exclusion constraint** | Only the DB sees all concurrent inserts |
+| Audit log | **Same DB transaction** as the change | An audit trail that can lose entries is useless |
+| Check-in / check-out | **Synchronous** | User needs immediate confirmation |
+| Email & in-app notifications | **Outbox → Kafka → worker** | Slow, retryable, user doesn't wait |
+| Monthly statistics | **Outbox → Kafka → worker** | Derived data; eventual consistency is fine |
+
+---
+
+## 🧭 Key Design Decisions
+
+> ⚠️ **Pending confirmation.** Decisions 1–6 below use the mentor's recommended defaults and should be confirmed (or changed) before implementation. Update this table once agreed.
+
+| # | Decision | Chosen (recommended) | Alternative considered |
+|---|---|---|---|
+| 1 | Tenant isolation | Shared schema + `company_id` + composite FKs + **Postgres RLS** | App-level `WHERE` only; schema-per-tenant; DB-per-tenant |
+| 2 | Event publishing | **Transactional outbox** | Publish after commit (can lose events); Debezium CDC (heavy) |
+| 3 | Identity | Email **globally unique**; one user belongs to one company | Email unique per company (login then needs company selection) |
+| 4 | Approvals | Reporting manager approves; HR/admin can approve anyone (incl. people with no manager) | Manager-only; multi-level approval chains |
+| 5 | Leave rules | Mon–Fri working days (no public holidays yet), half days allowed, yearly up-front allocation, **pending days reserved**, carry-forward up to policy limit | Monthly accrual; holiday calendar; no reservation |
+| 6 | Attendance | One check-in + one check-out per day; one start time + grace period per company | Multiple sessions/day; per-employee shifts |
+| 7 | DB access | **`pg` (node-postgres) + raw SQL**, migrations via `node-pg-migrate` | ORM (Prisma/Sequelize) — hides the locking/transactions this project is meant to show |
+| 8 | Validation | **Zod** | Joi (equally fine) |
+| 9 | IDs | UUID (`gen_random_uuid()`) | bigserial — guessable, enables ID enumeration |
+| 10 | Architecture | **Modular monolith** + separate worker processes | Microservices — no genuine reason at this scale |
+
+---
+
+## 🧰 Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React, React Router, Axios, Tailwind CSS, Context API (auth) — Redux Toolkit only if genuinely needed |
+| Backend | Node.js 22+, Express, **JavaScript** (ES modules) |
+| Database | PostgreSQL 16 via `pg`; migrations with `node-pg-migrate` |
+| Cache / rate limiting / temp data | Redis 7 (`ioredis`) |
+| Messaging | Apache Kafka (KRaft) via `kafkajs` |
+| Auth | `jsonwebtoken`, `bcrypt`, httpOnly cookies |
+| Validation | Zod |
+| Logging | pino + pino-http (JSON, with request IDs) |
+| Email | nodemailer → Mailpit (dev) / Amazon SES (prod) |
+| Testing | Jest, Supertest |
+| Infrastructure | Docker, Docker Compose, Nginx |
+| Cloud | AWS EC2 (app, Redis, Kafka containers), AWS RDS (PostgreSQL) |
+| CI/CD | GitHub Actions |
+
+---
+
+## 📁 Project Structure
+
+```
+worksphere/
+├── server/
+│   ├── src/
+│   │   ├── app.js                        # builds the Express app (no listen) — used by tests
+│   │   ├── server.js                     # starts HTTP server + graceful shutdown
+│   │   │
+│   │   ├── config/
+│   │   │   └── env.js                    # loads & validates env vars with Zod; fails fast
+│   │   │
+│   │   ├── db/
+│   │   │   ├── pool.js                   # pg Pool (+ statement timeout)
+│   │   │   ├── withTransaction.js        # BEGIN / SET LOCAL app.company_id / COMMIT / ROLLBACK
+│   │   │   ├── migrations/               # node-pg-migrate files (schema, constraints, RLS)
+│   │   │   └── seeds/                    # demo companies, employees, leave types
+│   │   │
+│   │   ├── shared/
+│   │   │   ├── errors/
+│   │   │   │   └── AppError.js           # NotFound, Conflict, Forbidden, Validation …
+│   │   │   ├── middleware/
+│   │   │   │   ├── requestId.js
+│   │   │   │   ├── authenticate.js       # verifies access token → req.auth {userId, companyId, role}
+│   │   │   │   ├── authorize.js          # authorize('admin','hr')
+│   │   │   │   ├── validate.js           # Zod: body / query / params
+│   │   │   │   ├── rateLimit.js          # Redis fixed/sliding window
+│   │   │   │   ├── timeout.js
+│   │   │   │   └── errorHandler.js       # single place that maps errors → HTTP responses
+│   │   │   ├── logger.js                 # pino
+│   │   │   ├── redis.js                  # ioredis client
+│   │   │   ├── cache.js                  # getOrSet / invalidate helpers
+│   │   │   ├── kafka.js                  # kafkajs client, producer, consumer factory (retry + DLT)
+│   │   │   ├── audit.js                  # writeAudit(client, {...}) — called inside transactions
+│   │   │   ├── outbox.js                 # addOutboxEvent(client, {...}) — called inside transactions
+│   │   │   ├── mailer.js
+│   │   │   └── dates.js                  # working-day counting, company timezone helpers
+│   │   │
+│   │   ├── modules/
+│   │   │   ├── auth/
+│   │   │   │   ├── auth.routes.js
+│   │   │   │   ├── auth.controller.js
+│   │   │   │   ├── auth.service.js
+│   │   │   │   ├── auth.repository.js
+│   │   │   │   ├── auth.schemas.js
+│   │   │   │   └── __tests__/
+│   │   │   ├── companies/                # same 5-file pattern + __tests__
+│   │   │   ├── departments/
+│   │   │   ├── employees/
+│   │   │   ├── leave/
+│   │   │   ├── attendance/
+│   │   │   ├── notifications/
+│   │   │   ├── reports/
+│   │   │   └── audit/
+│   │   │
+│   │   ├── health/
+│   │   │   └── health.routes.js          # /health/live, /health/ready
+│   │   │
+│   │   └── workers/
+│   │       ├── outbox-relay.js           # outbox_events → Kafka
+│   │       ├── notification.worker.js    # consumer group: notifications
+│   │       └── reporting.worker.js       # consumer group: reporting
+│   │
+│   ├── tests/
+│   │   ├── setup.js                      # test DB, truncate between tests
+│   │   ├── helpers/                      # createCompany(), loginAs(), …
+│   │   └── integration/
+│   │       ├── tenant-isolation.test.js
+│   │       ├── leave-concurrency.test.js
+│   │       └── …
+│   ├── Dockerfile
+│   ├── jest.config.js
+│   ├── .env.example
+│   └── package.json
+│
+├── client/
+│   ├── src/
+│   │   ├── api/
+│   │   │   ├── http.js                   # Axios instance + refresh-token interceptor
+│   │   │   └── *.api.js                  # one file per backend module
+│   │   ├── context/
+│   │   │   └── AuthContext.jsx
+│   │   ├── components/
+│   │   │   ├── ui/                       # Button, Input, Select, Modal, Badge, Table, Pagination, EmptyState, Spinner
+│   │   │   └── layout/                   # AppShell, Sidebar, Topbar, ProtectedRoute, RoleGate
+│   │   ├── features/
+│   │   │   ├── auth/                     # Login, RegisterCompany, ForgotPassword, ResetPassword
+│   │   │   ├── dashboard/
+│   │   │   ├── employees/
+│   │   │   ├── departments/
+│   │   │   ├── leave/                    # MyLeave, ApplyLeave, Approvals
+│   │   │   ├── attendance/
+│   │   │   ├── reports/
+│   │   │   ├── notifications/
+│   │   │   └── settings/                 # Profile, Sessions, Company settings, Leave policies
+│   │   ├── hooks/
+│   │   ├── utils/
+│   │   ├── routes.jsx
+│   │   └── main.jsx
+│   ├── Dockerfile                        # build → served by Nginx
+│   └── package.json
+│
+├── infra/
+│   ├── docker-compose.yml                # local: postgres, redis, kafka, kafka-ui, mailpit
+│   ├── docker-compose.prod.yml           # EC2: nginx, api, workers, redis, kafka (RDS external)
+│   ├── nginx/nginx.conf
+│   └── scripts/create-topics.sh
+│
+├── docs/
+│   ├── architecture.png
+│   ├── er-diagram.png
+│   ├── api.md                            # or openapi.yaml
+│   └── decisions/                        # Architecture Decision Records (ADRs)
+│       ├── 001-shared-schema-tenancy.md
+│       ├── 002-transactional-outbox.md
+│       └── 003-leave-balance-locking.md
+│
+├── .github/workflows/
+│   ├── ci.yml
+│   └── deploy.yml
+├── .gitignore
+└── README.md
+```
+
+> **Why modules own their full vertical slice:** everything about leave lives in `modules/leave/`. Modules call each other only through **services**, never another module's repository — this keeps boundaries clean enough to extract a service later if ever needed.
+
+---
+
+## 🗄️ Database Design
+
+### Conventions
+- UUID primary keys; `timestamptz` for instants, `date` for calendar days
+- `numeric(5,1)` for leave days (supports half days)
+- `CHECK` constraints for statuses (easier to migrate than Postgres `ENUM`)
+- Every tenant table has `company_id NOT NULL` and `UNIQUE (company_id, id)` so children can use **composite foreign keys**
+
+### Entity relationships
+
+```
+companies 1───* users 1───1 employees *───1 departments
+    │                           │  └── manager_id → employees (self-reference)
+    │                           ├──* leave_requests *───1 leave_types *───1 companies
+    │                           ├──* leave_balances *───1 leave_types
+    │                           └──* attendance_records
+    ├──* sessions (via users)
+    ├──* notifications (per user)
+    ├──* audit_logs
+    ├──* outbox_events
+    └──* monthly_leave_stats
+
+processed_events   (consumer bookkeeping)
+```
+
+### Tables
+
+| Table | Purpose | Key columns & constraints |
+|---|---|---|
+| **companies** | The tenant | `name`, `slug` (unique), `timezone`, `work_start_time`, `late_grace_minutes`, `status` |
+| **users** | Login identity (auth data only) | `company_id`, `email` (unique), `password_hash`, `role` CHECK in (admin, hr, manager, employee), `is_active`, `password_changed_at` |
+| **sessions** | One row per refresh token | `user_id`, `token_hash` (unique, SHA-256), `family_id`, `expires_at`, `revoked_at`, `replaced_by_id`, `user_agent`, `ip_address` |
+| **departments** | Company departments | `UNIQUE (company_id, name)` |
+| **employees** | HR record | `user_id` (unique), `employee_code` UNIQUE per company, `department_id`, `manager_id` (self), `job_title`, `date_joined`, `status`; composite FKs `(company_id, department_id)`, `(company_id, manager_id)`; `CHECK (manager_id <> id)` |
+| **leave_types** | Company leave policy | `code` (ANNUAL/SICK/UNPAID), `is_paid`, `requires_balance`, `default_days_per_year`, `max_carry_forward_days`; `UNIQUE (company_id, code)` |
+| **leave_balances** | Per employee / type / year | `allocated_days`, `carried_forward_days`, `used_days`, `pending_days`; `UNIQUE (employee_id, leave_type_id, year)`; `CHECK (used_days + pending_days <= allocated_days + carried_forward_days)` |
+| **leave_requests** | Requests + full history | `start_date`, `end_date`, `days_requested`, `status` (pending/approved/rejected/cancelled), `decided_by`, `decided_at`, `decision_note`; **exclusion constraint** against overlaps |
+| **attendance_records** | One row per employee per day | `work_date` (company-local), `check_in_at`, `check_out_at`, `worked_minutes`, `is_late`, `late_minutes`; `UNIQUE (employee_id, work_date)`; `CHECK (check_out_at > check_in_at)` |
+| **notifications** | In-app inbox | `user_id`, `type`, `title`, `body`, `entity_type`, `entity_id`, `read_at`, `source_event_id` (unique → no duplicates) |
+| **audit_logs** | Append-only audit trail | `actor_user_id`, `action`, `entity_type`, `entity_id`, `old_values` jsonb, `new_values` jsonb, `ip_address`, `request_id`; app DB role has no UPDATE/DELETE |
+| **outbox_events** | Events awaiting publish | `topic`, `message_key`, `event_type`, `payload` jsonb, `published_at`, `attempts`, `last_error` |
+| **processed_events** | Idempotent consumers | PK `(consumer_group, event_id)` |
+| **monthly_leave_stats** | Reporting aggregates | PK `(company_id, year, month, leave_type_id)`; `approved_requests`, `approved_days` |
+
+### The two most important constraints
+
+**1. No overlapping leave — enforced by the database**
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+ALTER TABLE leave_requests ADD CONSTRAINT no_overlapping_leave
+  EXCLUDE USING gist (
+    employee_id WITH =,
+    daterange(start_date, end_date, '[]') WITH &&
+  ) WHERE (status IN ('pending', 'approved'));
+```
+An application-level "check then insert" has a race: two simultaneous requests both pass the check. The constraint makes the second insert fail atomically.
+
+**2. Balance can never go negative**
+```sql
+CHECK (used_days + pending_days <= allocated_days + carried_forward_days)
+```
+
+### Key indexes
+
+| Index | Serves |
+|---|---|
+| `employees (company_id, status, last_name, id)` | Employee list with filter + keyset pagination |
+| `employees (company_id, manager_id)` | "My team" / approval routing |
+| `leave_requests (company_id, status, created_at)` | Pending approvals dashboard |
+| `leave_requests (company_id, employee_id, start_date DESC)` | Leave history |
+| `attendance_records (company_id, work_date)` | Daily attendance report |
+| `notifications (user_id, created_at DESC) WHERE read_at IS NULL` | Unread badge & inbox |
+| `audit_logs (company_id, created_at DESC)` | Audit log screen |
+| `outbox_events (created_at) WHERE published_at IS NULL` | Relay polling |
+
+### Concurrency-safe leave approval
+
+```
+BEGIN;
+  SET LOCAL app.company_id = $companyId;
+  SELECT * FROM leave_requests WHERE id = $1 FOR UPDATE;       -- lock request
+     → status <> 'pending' ? ROLLBACK + 409 Conflict
+  SELECT * FROM leave_balances WHERE … FOR UPDATE;             -- lock balance
+  UPDATE leave_balances SET pending_days = pending_days - d,
+                            used_days    = used_days + d;
+  UPDATE leave_requests SET status = 'approved', decided_by = …, decided_at = now();
+  INSERT INTO audit_logs (…);
+  INSERT INTO outbox_events (… 'leave.approved' …);
+COMMIT;
+```
+Two managers clicking Approve simultaneously: the second blocks on the row lock, then sees `approved` and receives **409**. Locks are always taken in the same order (request → balance) to avoid deadlocks.
+
+---
+
+## 🔐 Multi-Tenancy & Tenant Isolation
+
+**Model:** shared database, shared schema, `company_id` on every tenant table.
+
+| Approach | Isolation | Operational cost | Verdict |
+|---|---|---|---|
+| Database per tenant | Strongest | N databases, N migrations | Overkill |
+| Schema per tenant | Strong | N migrations, pooling pain | Overkill |
+| **Shared schema + `company_id`** | Enforced in 3 layers below | One schema | ✅ Chosen |
+
+### Three layers of defence
+
+1. **Application layer**
+   - `companyId` comes **only** from the verified access token (`req.auth.companyId`) — never from the URL, query or body.
+   - Every repository function requires `companyId` and includes it in every `WHERE`.
+   - Cross-tenant lookups return **404**, not 403 (don't reveal existence).
+
+2. **Schema layer — composite foreign keys**
+   - `FOREIGN KEY (company_id, employee_id) REFERENCES employees (company_id, id)`
+   - The database rejects a leave request, attendance row or manager link that points to another company's employee — even if application code is buggy.
+
+3. **Database layer — Row-Level Security**
+   ```sql
+   ALTER TABLE employees ENABLE ROW LEVEL SECURITY;
+   ALTER TABLE employees FORCE ROW LEVEL SECURITY;
+   CREATE POLICY tenant_isolation ON employees
+     USING (company_id = current_setting('app.company_id')::uuid);
+   ```
+   - `withTransaction()` runs `SET LOCAL app.company_id = …` at the start of every transaction.
+   - `SET LOCAL` (not `SET`) is essential with connection pooling — otherwise the tenant leaks to the next request on that connection.
+   - `FORCE` is required because table owners bypass RLS by default.
+   - Migrations run as a separate owner role; the app connects as a non-owner role.
+
+Proven by `tests/integration/tenant-isolation.test.js`: company B's token must never read, update or reference company A's data via any endpoint.
+
+---
+
+## 📨 Events & Kafka
+
+### Why the transactional outbox
+
+Publishing to Kafka after `COMMIT` can lose events if the process crashes between the two steps (the **dual-write problem**). Instead, the event row is inserted into `outbox_events` **in the same transaction** as the business change, and a relay publishes it:
+
+```
+API transaction:  UPDATE leave_requests … ; INSERT INTO outbox_events … ; COMMIT
+Relay (loop):     SELECT … WHERE published_at IS NULL ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED
+                  → producer.send() → UPDATE outbox_events SET published_at = now()
+```
+If the relay crashes after sending but before marking → the event is sent again → **at-least-once** → consumers must be idempotent.
+
+### Topics
+
+| Topic | Partitions | Message key | Events | Consumer groups |
+|---|---|---|---|---|
+| `leave-events` | 3 | `leave_request_id` | `leave.requested`, `leave.approved`, `leave.rejected`, `leave.cancelled` | `notifications`, `reporting` |
+| `employee-events` | 3 | `employee_id` | `employee.created` | `notifications` |
+| `attendance-events` | 3 | `employee_id` | `attendance.recorded` | `reporting` |
+| `leave-events.dlt`, `employee-events.dlt`, `attendance-events.dlt` | 1 | same | messages that failed after max retries | manual / replay script |
+
+- **Ordering:** guaranteed only within a partition → keying by `leave_request_id` keeps `requested` before `approved` for the same request.
+- **Consumer groups:** `notifications` and `reporting` each receive every `leave-events` message independently; within a group, partitions are split across worker instances.
+
+### Event envelope
+
+```json
+{
+  "eventId": "uuid (= outbox_events.id)",
+  "eventType": "leave.approved",
+  "companyId": "uuid",
+  "occurredAt": "2026-11-13T10:00:00Z",
+  "version": 1,
+  "payload": { "leaveRequestId": "…", "employeeId": "…", "approvedBy": "…", "days": 3 }
+}
+```
+
+### Consumer processing rules
+
+1. Begin DB transaction
+2. `INSERT INTO processed_events (consumer_group, event_id)` — duplicate key ⇒ already handled ⇒ skip
+3. Do the work (insert notification / upsert stats)
+4. Commit DB transaction
+5. Commit Kafka offset (**after** the DB commit — never before)
+6. On error: retry with exponential backoff (3 attempts) → then publish to `<topic>.dlt` and commit offset so the partition isn't blocked
+
+Emails are sent **after** the DB commit; a crash between "commit" and "send" is handled by a `email_sent_at` flag on the notification and a retry sweep (documented trade-off: email is at-least-once).
+
+---
+
+## ⚡ Redis Usage
+
+| Use | Key pattern | TTL | Notes |
+|---|---|---|---|
+| Company settings cache | `company:{id}:settings` | 10 min | Invalidated on update |
+| Leave types cache | `company:{id}:leave-types` | 10 min | Invalidated on policy change |
+| Dashboard counts | `company:{id}:dashboard` | 60 s | Short TTL; slight staleness acceptable |
+| Login rate limit | `rl:login:{ip}` / `rl:login:{email}` | 15 min | 5 attempts |
+| Password reset rate limit | `rl:reset:{email}` | 1 h | 3 requests |
+| Password reset token | `reset:{sha256(token)}` → userId | 15 min | `GETDEL` = single use |
+| Scheduled-job lock | `lock:job:yearly-allocation` | job duration | **Only** distributed lock in the system |
+
+**Cache strategy:** cache-aside — read from Redis, on miss read Postgres and populate; on write, update Postgres **then** delete the key. Redis is never the source of truth; if Redis is down, reads fall back to Postgres and rate limiting fails **closed** for login (deny) and **open** elsewhere (documented trade-off).
+
+**Why no Redis lock for leave approval:** Postgres row locks (`FOR UPDATE`) are transactional, released automatically on commit/rollback, and live next to the data. A Redis lock would add a second system that can disagree with the database.
+
+---
+
+## 🛠️ Build Guide — Step 1 to Step 20
+
+> One module at a time. Each step ends with a ✅ **definition of done**. Don't start the next step until the current one passes its tests. Commit after every step.
+
+### Phase 0 — Foundations
+
+**Step 1 · Prerequisites**
+Node.js 22+, Docker Desktop, Git, a Postgres client (psql / TablePlus / DBeaver), an AWS account (needed from Step 19).
+✅ `node -v`, `docker compose version` work.
+
+**Step 2 · Repository & tooling**
+Create `server/` and `client/`, ESLint + Prettier, `.gitignore`, `.env.example`, Jest config.
+✅ `npm run lint` and `npm test` (empty) succeed.
+
+**Step 3 · Local infrastructure (Docker Compose)**
+`infra/docker-compose.yml` with Postgres 16, Redis 7, Kafka (KRaft, single broker), Kafka UI, Mailpit. Script to create topics + DLTs.
+✅ All containers healthy; topics visible in Kafka UI (http://localhost:8085).
+
+**Step 4 · Server skeleton**
+`config/env.js` (Zod-validated env, fail fast), `logger.js`, `app.js` / `server.js` split, `requestId`, `errorHandler`, `AppError` classes, `validate` middleware, `/health/live` + `/health/ready` (checks Postgres & Redis), graceful shutdown (stop accepting → finish in-flight → close pool/Redis/Kafka).
+✅ `/health/ready` returns 200; unknown route returns a consistent JSON 404; `Ctrl+C` shuts down cleanly.
+
+**Step 5 · Database setup & migrations**
+`db/pool.js`, `withTransaction()` helper, `node-pg-migrate`. Create **all core tables, constraints and indexes** from the design above. Seed script with two demo companies.
+✅ `npm run migrate:up` and `migrate:down` both work; constraints verified manually in psql (try inserting an overlapping leave → rejected).
+
+### Phase 1 — Identity & tenancy
+
+**Step 6 · Auth module — registration & login**
+Company registration (creates company + admin user + employee + default leave types in **one transaction**), login, bcrypt, access token (15 min), refresh token (7 days, httpOnly cookie, hashed in `sessions`).
+✅ Register → login → `GET /auth/me` works; wrong password returns generic error.
+
+**Step 7 · Auth module — refresh rotation, logout, sessions, rate limiting**
+Rotation with **reuse detection** (revoke whole `family_id`), logout, list & revoke sessions, Redis login rate limiting.
+✅ Reusing an old refresh token revokes the family; 6th failed login → 429.
+
+**Step 8 · Auth module — password reset & RBAC**
+Forgot/reset password (Redis token, `GETDEL`, revoke all sessions after reset, email via Mailpit), `authorize(...roles)` middleware.
+✅ Reset link works once only; employee hitting an admin route → 403.
+
+**Step 9 · Tenant isolation hardening (RLS)**
+Separate migration role vs app role, RLS policies + `FORCE`, `SET LOCAL app.company_id` in `withTransaction`. Write `tenant-isolation.test.js`.
+✅ Isolation tests pass; deliberately removing a `WHERE company_id` in a repository still returns no foreign rows.
+
+### Phase 2 — Core HR
+
+**Step 10 · Company & department modules**
+Company settings (timezone, work start, grace), department CRUD, Redis cache-aside for settings.
+✅ Settings cached and invalidated on update (verify with `redis-cli MONITOR`).
+
+**Step 11 · Employee module**
+Create (creates user + employee in one transaction, emits `employee.created` via outbox), update, deactivate (also revokes sessions), assign department/manager/role (audit-logged), profile, search + filters + **keyset pagination**.
+✅ Role change appears in audit log; pagination stable while data changes; manager-cycle prevented.
+
+**Step 12 · Audit module**
+`writeAudit()` used inside existing transactions; read API with filters for admin/HR.
+✅ Every create/update/role change/admin action produces exactly one audit row with before/after.
+
+### Phase 3 — Leave & attendance
+
+**Step 13 · Leave module — policies & balances**
+Leave types per company, yearly allocation (scheduled job with Redis lock), carry-forward, balance endpoint.
+✅ Balances created for all active employees; job running twice concurrently allocates once.
+
+**Step 14 · Leave module — apply, approve, reject, cancel**
+Working-day calculation in company timezone, pending-day reservation, overlap constraint → 409, concurrency-safe approval (row locks), cancel pending, history, audit + outbox events.
+✅ `leave-concurrency.test.js`: 10 parallel approvals → exactly 1 succeeds; overlapping apply → 409; balance never negative.
+
+**Step 15 · Attendance module**
+Check-in/out (company timezone), worked minutes, late detection, daily & monthly reports, `attendance.recorded` event.
+✅ Double check-in → 409; late flag correct around timezone/DST boundaries (unit tests).
+
+### Phase 4 — Async processing
+
+**Step 16 · Outbox relay & Kafka consumers**
+Relay worker (`FOR UPDATE SKIP LOCKED`), consumer factory with retries + DLT, `processed_events` idempotency, notification worker (in-app + email), reporting worker (`monthly_leave_stats`).
+✅ Kill a worker mid-processing → restart → no duplicate notifications; a poison message lands in the DLT; two notification workers split partitions.
+
+**Step 17 · Notifications & reports APIs**
+Inbox (unread count, mark read), dashboard endpoint (cached 60 s), monthly leave & attendance summaries.
+✅ Approving leave produces an in-app notification + Mailpit email within seconds.
+
+### Phase 5 — Frontend
+
+**Step 18 · React SaaS dashboard**
+App shell (sidebar, topbar, notification bell), Axios refresh interceptor (single in-flight refresh), protected & role-gated routes, reusable UI kit, pages: login/register/reset, dashboard, employees, departments, my leave, apply leave, approvals, attendance, reports, audit log, profile/sessions/settings. Loading, empty and error states everywhere.
+✅ Full user journey for each role works end-to-end in the browser.
+
+### Phase 6 — Ship it
+
+**Step 19 · Dockerise & deploy to AWS**
+Multi-stage Dockerfiles, `docker-compose.prod.yml`, RDS PostgreSQL (private subnet), EC2 running Nginx + API + workers + Redis + Kafka containers, HTTPS (Let's Encrypt), secrets in SSM Parameter Store / `.env` on host (not in Git).
+✅ App reachable over HTTPS; `/health/ready` green; data persists across redeploys.
+
+**Step 20 · CI/CD, documentation, polish**
+GitHub Actions (lint → test with service containers → build images → deploy via SSH), architecture diagram, ER diagram, API docs, ADRs, screenshots, demo video.
+✅ Push to `main` deploys automatically; README complete.
+
+---
+
+## ▶️ Running Locally
+
+```bash
+# 1. Clone
+git clone https://github.com/<you>/worksphere.git && cd worksphere
+
+# 2. Infrastructure
+docker compose -f infra/docker-compose.yml up -d
+./infra/scripts/create-topics.sh
+
+# 3. Backend
+cd server
+cp .env.example .env
+npm install
+npm run migrate:up
+npm run seed
+npm run dev                 # API on :4000
+
+# 4. Workers (separate terminals)
+npm run worker:outbox
+npm run worker:notifications
+npm run worker:reporting
+
+# 5. Frontend
+cd ../client
+npm install
+npm run dev                 # http://localhost:5173
+```
+
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:5173 |
+| API | http://localhost:4000 |
+| Kafka UI | http://localhost:8085 |
+| Mailpit (emails) | http://localhost:8025 |
+
+**Demo logins** (from seed): `admin@acme.test`, `manager@acme.test`, `employee@acme.test` — password `Password123!` (local only).
+
+---
+
+## 🔧 Environment Variables
+
+```env
+NODE_ENV=development
+PORT=4000
+CLIENT_ORIGIN=http://localhost:5173
+
+# PostgreSQL — app role (no table ownership, subject to RLS)
+DATABASE_URL=postgresql://worksphere_app:app_password@localhost:5432/worksphere
+# PostgreSQL — migration/owner role (used only by migrations)
+MIGRATION_DATABASE_URL=postgresql://worksphere_owner:owner_password@localhost:5432/worksphere
+DB_STATEMENT_TIMEOUT_MS=5000
+
+REDIS_URL=redis://localhost:6379
+
+KAFKA_BROKERS=localhost:9092
+KAFKA_CLIENT_ID=worksphere
+
+JWT_ACCESS_SECRET=change-me-long-random
+JWT_ACCESS_TTL=15m
+REFRESH_TOKEN_TTL_DAYS=7
+BCRYPT_ROUNDS=12
+
+PASSWORD_RESET_TTL_SECONDS=900
+APP_URL=http://localhost:5173
+
+SMTP_HOST=localhost
+SMTP_PORT=1025
+MAIL_FROM="WorkSphere <no-reply@worksphere.test>"
+
+LOG_LEVEL=info
+REQUEST_TIMEOUT_MS=10000
+```
+
+All variables are validated at startup by `config/env.js`; the process exits with a clear message if any are missing or malformed.
+
+---
+
+## 📡 API Overview
+
+Base path: `/api/v1`. All endpoints except auth/registration require `Authorization: Bearer <accessToken>`.
+
+| Module | Method | Endpoint | Roles |
+|---|---|---|---|
+| Auth | POST | `/auth/register-company` | public |
+| | POST | `/auth/login` | public |
+| | POST | `/auth/refresh` | refresh cookie |
+| | POST | `/auth/logout` | any |
+| | GET | `/auth/me` | any |
+| | GET / DELETE | `/auth/sessions`, `/auth/sessions/:id` | any (own) |
+| | POST | `/auth/forgot-password`, `/auth/reset-password` | public |
+| Company | GET / PATCH | `/company/settings` | admin |
+| Departments | GET / POST / PATCH / DELETE | `/departments[/:id]` | read: all · write: admin, hr |
+| Employees | GET | `/employees?search=&departmentId=&status=&limit=&cursor=` | admin, hr, manager (team) |
+| | POST / PATCH | `/employees[/:id]` | admin, hr |
+| | POST | `/employees/:id/deactivate` | admin, hr |
+| | PATCH | `/employees/:id/role` | admin |
+| Leave | GET / POST / PATCH | `/leave-types[/:id]` | read: all · write: admin |
+| | GET | `/leave/balances/me` | any |
+| | POST | `/leave/requests` | any |
+| | GET | `/leave/requests/me` | any |
+| | GET | `/leave/requests/pending` | manager, hr, admin |
+| | POST | `/leave/requests/:id/approve` · `/reject` | manager (reports), hr, admin |
+| | POST | `/leave/requests/:id/cancel` | owner (pending only) |
+| Attendance | POST | `/attendance/check-in`, `/attendance/check-out` | any |
+| | GET | `/attendance/me?month=` | any |
+| | GET | `/attendance/daily?date=` · `/monthly?month=` | manager, hr, admin |
+| Notifications | GET | `/notifications?unread=true` | any |
+| | POST | `/notifications/:id/read`, `/notifications/read-all` | any |
+| Reports | GET | `/reports/dashboard` | hr, admin (manager: team scope) |
+| | GET | `/reports/leave/monthly?year=` | hr, admin |
+| Audit | GET | `/audit-logs?entityType=&actorId=&from=&to=` | admin, hr |
+| Health | GET | `/health/live`, `/health/ready` | public |
+
+### Error format
+```json
+{ "error": { "code": "LEAVE_OVERLAP", "message": "You already have leave during these dates.", "requestId": "…" } }
+```
+
+| Status | When |
+|---|---|
+| 400 | Validation failed (Zod details included) |
+| 401 | Missing/expired/invalid token |
+| 403 | Authenticated but role not allowed |
+| 404 | Not found **or belongs to another tenant** |
+| 409 | Conflict: overlap, already decided, duplicate check-in, insufficient balance |
+| 429 | Rate limited |
+| 500 | Unexpected — logged with requestId, generic message to client |
+
+Full documentation: [`docs/api.md`](docs/api.md)
+
+---
+
+## 🧪 Testing
+
+| Type | Tooling | Examples |
+|---|---|---|
+| Unit | Jest | working-day calculation, late detection across timezones/DST, token helpers |
+| Integration | Jest + Supertest + real Postgres/Redis (Docker) | every endpoint's happy path + auth/role failures |
+| **Tenant isolation** | Supertest | company B can't read/update/reference company A data on any endpoint |
+| **Concurrency** | Jest + `Promise.all` | 10 parallel approvals → 1 success; parallel overlapping applies → 1 success; balance never negative |
+| Idempotency | Jest | same Kafka event processed twice → one notification |
+
+```bash
+cd server
+npm test                  # all
+npm run test:unit
+npm run test:integration  # requires docker compose up
+npm run test:coverage
+```
+
+---
+
+## ☁️ Deployment (AWS)
+
+```
+                Internet
+                   │ HTTPS
+           ┌───────▼────────┐
+           │  EC2 instance  │  (public subnet, security group: 80/443 only)
+           │ ┌────────────┐ │
+           │ │   Nginx    │ │  TLS (Let's Encrypt), serves React, proxies /api
+           │ ├────────────┤ │
+           │ │ API        │ │
+           │ │ outbox     │ │
+           │ │ workers ×2 │ │
+           │ │ Redis      │ │
+           │ │ Kafka      │ │
+           │ └────────────┘ │
+           └───────┬────────┘
+                   │ 5432 (security group: only from EC2)
+           ┌───────▼────────┐
+           │  RDS Postgres  │  (private subnet, automated backups, encryption at rest)
+           └────────────────┘
+```
+
+| Decision | Choice | Why / trade-off |
+|---|---|---|
+| Compute | Single EC2 + Docker Compose | Simple, cheap, easy to reason about. No Kubernetes/EKS. |
+| Database | **RDS PostgreSQL** | Managed backups, patching, point-in-time recovery |
+| Redis | Container on EC2 | Cheap; ElastiCache is the upgrade path |
+| Kafka | Single-broker container on EC2 | Amazon MSK is expensive for a portfolio project; documented as the production upgrade path |
+| Secrets | SSM Parameter Store → written to `.env` on deploy | Never committed to Git |
+| TLS | Let's Encrypt via certbot | Free, automated renewal |
+| Email | Amazon SES | Cheap, reliable; sandbox needs verified recipients |
+
+**Known limitations (be honest in interviews):** single EC2 is a single point of failure; single Kafka broker has no replication. Production next steps: multiple instances behind an ALB, ElastiCache, MSK (3 brokers, RF=3), RDS Multi-AZ.
+
+---
+
+## 🔁 CI/CD
+
+**`ci.yml`** — on every push / PR:
+1. Install dependencies (cached)
+2. Lint
+3. Start Postgres + Redis + Kafka as GitHub Actions **service containers**
+4. Run migrations → unit + integration tests
+5. Build Docker images
+
+**`deploy.yml`** — on push to `main` (after CI passes):
+1. Build & push images to Amazon ECR (or GHCR)
+2. SSH to EC2 → pull images → run migrations → `docker compose up -d` (rolling restart of API & workers)
+3. Smoke test `/health/ready`
+
+---
+
+## 💥 Failure Scenarios
+
+| Scenario | What happens | How it's handled |
+|---|---|---|
+| Two managers approve the same request simultaneously | Second waits on row lock | Sees `approved` → 409 |
+| Employee double-clicks "Apply" | Two inserts race | Exclusion constraint rejects the second → 409 |
+| API crashes after DB commit, before Kafka publish | — | Not possible to lose the event: it's in `outbox_events` |
+| Relay crashes after publish, before marking published | Event published twice | Consumers dedupe via `processed_events` |
+| Consumer crashes mid-processing | Offset not committed | Message redelivered on restart; idempotency prevents duplicates |
+| Malformed / poison message | Handler always throws | 3 retries with backoff → DLT; partition keeps moving |
+| Kafka down | Outbox rows accumulate | API unaffected; relay catches up when Kafka returns |
+| Redis down | Cache miss on every read | Fall back to Postgres; login rate limiting fails closed |
+| SMTP / SES down | Email send fails | In-app notification still created; email retried via `email_sent_at` sweep |
+| Slow query | Request hangs | `statement_timeout` + request timeout middleware |
+| Refresh token stolen and used | Legitimate user's next refresh reuses a revoked token | Whole token family revoked; user must log in again |
+| Deploy / `SIGTERM` | In-flight requests | Graceful shutdown drains requests, closes pool, disconnects Kafka |
+
+---
+
+## 🎤 Interview Talking Points
+
+- Why a modular monolith instead of microservices — and when would you split it?
+- How is tenant isolation enforced? What happens if a developer forgets `WHERE company_id`?
+- Shared schema vs schema-per-tenant vs DB-per-tenant.
+- Why `SET LOCAL` and not `SET` with RLS and connection pooling?
+- How do you prevent overlapping leave under concurrency? Why not just check in code?
+- Walk through approving leave. What locks are taken, in what order, and why?
+- Optimistic vs pessimistic locking — which did you use where, and why?
+- Why store balances rather than compute them? How do you detect drift?
+- What is the dual-write problem? How does the outbox solve it?
+- What does at-least-once mean, and how are your consumers idempotent?
+- When do you commit Kafka offsets, and what happens if you commit too early?
+- How does message ordering work in Kafka? Why key by `leave_request_id`?
+- What is a dead-letter topic and when does a message go there?
+- Why is the audit log synchronous but notifications asynchronous?
+- How does refresh-token rotation with reuse detection work?
+- Why are reset tokens and refresh tokens stored hashed?
+- Cache-aside: how do you invalidate, and what consistency do you accept?
+- Offset vs keyset pagination — which and why?
+- What breaks first if traffic grows 100×?
+
+---
+
+## ✅ Roadmap Checklist
+
+**Phase 0 — Foundations**
+- [ ] 1. Prerequisites
+- [ ] 2. Repository & tooling
+- [ ] 3. Docker Compose infrastructure + Kafka topics
+- [ ] 4. Server skeleton (config, logging, errors, validation, health, graceful shutdown)
+- [ ] 5. Migrations: tables, constraints, indexes, seeds
+
+**Phase 1 — Identity & tenancy**
+- [ ] 6. Registration & login
+- [ ] 7. Refresh rotation, logout, sessions, rate limiting
+- [ ] 8. Password reset & RBAC
+- [ ] 9. Row-Level Security + tenant-isolation tests
+
+**Phase 2 — Core HR**
+- [ ] 10. Company settings & departments (+ caching)
+- [ ] 11. Employees (search, filters, keyset pagination)
+- [ ] 12. Audit logs
+
+**Phase 3 — Leave & attendance**
+- [ ] 13. Leave policies & balances (+ allocation job)
+- [ ] 14. Apply / approve / reject / cancel (+ concurrency tests)
+- [ ] 15. Attendance & reports
+
+**Phase 4 — Async processing**
+- [ ] 16. Outbox relay, consumers, retries, DLT, idempotency
+- [ ] 17. Notifications & dashboard APIs
+
+**Phase 5 — Frontend**
+- [ ] 18. React SaaS dashboard
+
+**Phase 6 — Ship it**
+- [ ] 19. Docker + AWS (EC2, RDS, HTTPS)
+- [ ] 20. CI/CD, diagrams, API docs, ADRs, demo
+
+**Possible extensions (only after v1 is solid)**
+- [ ] Public holiday calendar per company
+- [ ] Multi-level approval chains
+- [ ] Monthly leave accrual
+- [ ] Migrate to TypeScript
+- [ ] OpenTelemetry tracing across API → Kafka → workers
+- [ ] ALB + multiple EC2 instances, ElastiCache, MSK
+
+---
+
+## 📄 License
+
+MIT
